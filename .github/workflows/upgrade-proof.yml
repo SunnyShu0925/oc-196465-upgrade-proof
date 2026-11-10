@@ -1,0 +1,155 @@
+name: doctor-upgrade-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_ref:
+        description: PR branch in SunnyShu0925/openclaw
+        required: true
+        default: fix/bug-360-stale-oauth-shadow-readdir
+      stable_version:
+        description: Published driver version that owns the starting state
+        required: true
+        default: "2026.11.2"
+      candidate_version:
+        description: Candidate version stamped into the built tarball
+        required: true
+        default: "2026.11.3-proof.1"
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout proof harness
+        uses: actions/checkout@v4
+
+      - name: Checkout reviewed PR head
+        uses: actions/checkout@v4
+        with:
+          repository: SunnyShu0925/openclaw
+          ref: ${{ inputs.pr_ref }}
+          path: openclaw
+          fetch-depth: 1
+
+      - name: Report head identity
+        run: |
+          git -C openclaw rev-parse HEAD | tee /tmp/head-sha.txt
+          git -C openclaw log -1 --format='%H %s'
+          ldd --version | head -1
+
+      - name: Setup Node 24.22.1
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+
+      - name: Enable pnpm and prepare environment
+        run: |
+          corepack enable
+          (cd openclaw && corepack install)
+          echo "npm_config_prefix=$HOME/.npm-global" >> "$GITHUB_ENV"
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Install workspace dependencies
+        working-directory: openclaw
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the CLI/dist from the reviewed head
+        working-directory: openclaw
+        run: pnpm build:ci-artifacts
+
+      - name: Patch missing dist type stubs (packer integrity check)
+        working-directory: openclaw
+        run: |
+          # The packer integrity checker verifies every package.json export target exists.
+          node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const root = pkg.exports || {};
+          const ensure = (target) => {
+            if (typeof target === "string" && target.startsWith("./dist/")) {
+              const f = target.slice(2);
+              if (!fs.existsSync(f)) {
+                if (f.endsWith(".d.ts")) {
+                  fs.writeFileSync(f, "export {};\n");
+                  console.log("stub created: " + f);
+                } else {
+                  fs.mkdirSync(require("path").dirname(f), { recursive: true });
+                  fs.writeFileSync(f, "");
+                  console.log("placeholder created: " + f);
+                }
+              }
+            }
+          };
+          for (const [, val] of Object.entries(root)) {
+            if (val && typeof val === "object") {
+              for (const v of Object.values(val)) ensure(v);
+            } else {
+              ensure(val);
+            }
+          }
+          '
+
+      - name: Stamp the candidate version
+        working-directory: openclaw
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        run: |
+          node --input-type=module -e '
+          import { stampFixtureVersion } from "./scripts/e2e/lib/update-first-hop-package-fixtures.mjs";
+          stampFixtureVersion(process.cwd(), process.env.CANDIDATE_VERSION);
+          console.log("stamped:", process.env.CANDIDATE_VERSION);
+          '
+          node -e 'console.log("package.json version:", require("./package.json").version)'
+          node -e 'console.log("build-info version:", require("./dist/build-info.json").version)'
+
+      - name: Package the candidate artifact
+        working-directory: openclaw
+        run: |
+          node scripts/package-openclaw-for-docker.mjs --skip-build --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/pkg" --output-name openclaw-candidate.tgz
+          ls -l "$RUNNER_TEMP/pkg/"
+          tar -xzOf "$RUNNER_TEMP/pkg/openclaw-candidate.tgz" package/package.json \
+            | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log("candidate version:", JSON.parse(s).version))'
+
+      - name: Verify the candidate carries the fix
+        run: |
+          TGZ="$RUNNER_TEMP/pkg/openclaw-candidate.tgz"
+          CHUNK=$(tar -tzf "$TGZ" | grep -E 'package/dist/stale-oauth-profile-shadows.*\.mjs$' | head -1)
+          echo "chunk: $CHUNK"
+          tar -xzOf "$TGZ" "$CHUNK" | grep -c "Cannot list agent directories" | sed 's/^/warning-copy matches: /'
+          tar -xzOf "$TGZ" "$CHUNK" | grep -c "hasErrnoCode" | sed 's/^/errno-branch matches: /'
+
+      - name: Run driver-lane upgrade proof
+        working-directory: openclaw
+        env:
+          CHECKOUT_DIR: ${{ github.workspace }}/openclaw
+          STABLE_VERSION: ${{ inputs.stable_version }}
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+          CANDIDATE_TARBALL: ${{ runner.temp }}/pkg/openclaw-candidate.tgz
+        run: bash "$GITHUB_WORKSPACE/scripts/proof.sh"
+
+      - name: Upload proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-logs
+          path: |
+            /tmp/proof-summary.txt
+            /tmp/head-sha.txt
+            /tmp/update.json
+            /tmp/update.err
+            /tmp/doctor-driver.log
+            /tmp/doctor-candidate-fix.log
+            /tmp/doctor-candidate.log
+            /tmp/doctor-eacces.log
+            /tmp/doctor-control.log
+            /tmp/doctor-after-fix.log
+            /tmp/before-config.txt
+            /tmp/after-config.txt
+            /tmp/before-state.txt
+            /tmp/after-state.txt
+          if-no-files-found: warn
