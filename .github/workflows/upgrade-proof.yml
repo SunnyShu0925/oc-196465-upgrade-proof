@@ -57,6 +57,20 @@ jobs:
         working-directory: openclaw
         run: pnpm install --frozen-lockfile
 
+      - name: Stamp the candidate version
+        working-directory: openclaw
+        env:
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        run: |
+          node -e '
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const source = pkg.version;
+          pkg.version = process.env.CANDIDATE_VERSION;
+          fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          console.log(`package.json version: ${source} -> ${pkg.version}`);
+          '
+
       - name: Build the CLI/dist from the reviewed head
         working-directory: openclaw
         run: pnpm build:ci-artifacts
@@ -93,18 +107,19 @@ jobs:
           }
           '
 
-      - name: Stamp the candidate version
+      - name: Confirm the build carries the candidate version
         working-directory: openclaw
         env:
           CANDIDATE_VERSION: ${{ inputs.candidate_version }}
         run: |
-          node --input-type=module -e '
-          import { stampFixtureVersion } from "./scripts/e2e/lib/update-first-hop-package-fixtures.mjs";
-          stampFixtureVersion(process.cwd(), process.env.CANDIDATE_VERSION);
-          console.log("stamped:", process.env.CANDIDATE_VERSION);
+          node -e '
+          const version = require("./dist/build-info.json").version;
+          if (version !== process.env.CANDIDATE_VERSION) {
+            console.error("build-info version mismatch:", version);
+            process.exit(1);
+          }
+          console.log("build-info version:", version);
           '
-          node -e 'console.log("package.json version:", require("./package.json").version)'
-          node -e 'console.log("build-info version:", require("./dist/build-info.json").version)'
 
       - name: Package the candidate artifact
         working-directory: openclaw
