@@ -177,9 +177,12 @@ note "--- non-empty tables, after ---"; grep '^  nonempty: ' /tmp/after-state.tx
 
 # ── Step 11: the fix, exercised on the upgraded state ──────────────────────
 say "step 11: agent-dir read failure surfaces on the upgraded state"
-note "--- candidate writes the agent-dir store the scan reads ---"
+note "--- candidate writes its own profile (satisfies the scan's store gate) ---"
 printf '%s\n' "$TOKEN" | "$NEW_BIN" models auth paste-token --agent main --provider anthropic --profile-id anthropic:proof 2>&1 | tail -4 | tee -a "$SUMMARY"
-note "scan gate store $AGENT_STORE: $([ -f "$AGENT_STORE" ] && echo present || echo absent)"
+# The scan treats a missing root as ENOENT (silent by design), so the scene needs
+# an agents root that exists and cannot be listed.
+mkdir -p "$STATE/agents/proof-agent/agent"
+note "agents root created: mode=$(stat -c %a "$STATE/agents") entries=$(ls -1 "$STATE/agents" | tr '\n' ' ')"
 note "agents root mode before: $(stat -c %a "$STATE/agents")"
 chmod 111 "$STATE/agents"
 note "agents root mode now:    $(stat -c %a "$STATE/agents") (list denied, traversal kept)"
