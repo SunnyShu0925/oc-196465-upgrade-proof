@@ -74,7 +74,7 @@ cat "$STATE/openclaw.json" | tee -a "$SUMMARY"
 
 # ── Step 4: driver writes an auth profile ───────────────────────────────────
 say "step 4: driver writes an auth profile (models auth paste-token)"
-TOKEN="sk-ant-proof-redacted-0000000000000000"
+TOKEN="sk-ant-oat01-proof-synthetic-$(printf 'a%.0s' $(seq 1 70))"
 printf '%s\n' "$TOKEN" | "$DRIVER" models auth paste-token --agent main --provider anthropic --profile-id anthropic:proof 2>&1 | tail -5 | tee -a "$SUMMARY"
 PASTE_EXIT=${PIPESTATUS[1]}
 note "paste-token exit=$PASTE_EXIT"
@@ -84,7 +84,7 @@ find "$STATE/agents" -name "*.sqlite" 2>/dev/null | sort | tee -a "$SUMMARY"
 
 # ── Step 5: snapshot before ─────────────────────────────────────────────────
 say "step 5: snapshot the driver state (before upgrade)"
-node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" >/tmp/before-config.txt 2>&1
+node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" /tmp/before-config.json >/tmp/before-config.txt 2>&1
 node "$WORKSPACE/scripts/snapshot-state.mjs" "$STATE" >/tmp/before-state.txt 2>&1
 tee -a "$SUMMARY" </tmp/before-config.txt
 tee -a "$SUMMARY" </tmp/before-state.txt
@@ -130,16 +130,17 @@ grep -E "Doctor complete|Doctor blocked|required repairs" /tmp/doctor-candidate.
 
 # ── Step 10: preservation assertions ───────────────────────────────────────
 say "step 10: settings + auth preservation after upgrade"
-node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" >/tmp/after-config.txt 2>&1
+node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" /tmp/after-config.json >/tmp/after-config.txt 2>&1
 node "$WORKSPACE/scripts/snapshot-state.mjs" "$STATE" >/tmp/after-state.txt 2>&1
 tee -a "$SUMMARY" </tmp/after-config.txt
 tee -a "$SUMMARY" </tmp/after-state.txt
 
-BEFORE_SETTINGS=$(grep '^settings_without_meta: ' /tmp/before-config.txt | cut -d' ' -f2-)
-AFTER_SETTINGS=$(grep '^settings_without_meta: ' /tmp/after-config.txt | cut -d' ' -f2-)
+node "$WORKSPACE/scripts/compare-settings.mjs" /tmp/before-config.json /tmp/after-config.json >/tmp/settings-diff.txt 2>&1
+SETTINGS_EXIT=$?
+tee -a "$SUMMARY" </tmp/settings-diff.txt
 SETTINGS_OK=0
-[ -n "$BEFORE_SETTINGS" ] && [ "$BEFORE_SETTINGS" = "$AFTER_SETTINGS" ] && SETTINGS_OK=1
-check "operator settings unchanged by the upgrade (excluding version stamp)" "$SETTINGS_OK"
+[ "$SETTINGS_EXIT" -eq 0 ] && SETTINGS_OK=1
+check "operator settings preserved through the upgrade (gateway, logging, plugins)" "$SETTINGS_OK"
 
 BEFORE_STAMP=$(grep '^meta_lastTouchedVersion: ' /tmp/before-config.txt | cut -d' ' -f2-)
 AFTER_STAMP=$(grep '^meta_lastTouchedVersion: ' /tmp/after-config.txt | cut -d' ' -f2-)
@@ -190,12 +191,14 @@ check "warning appears only when the agents root cannot be listed" "$([ "$EACCES
 say "step 12: doctor --fix after the scenes keeps state"
 "$NEW_BIN" doctor --fix --non-interactive >/tmp/doctor-after-fix.log 2>&1
 note "doctor --fix exit=$?"
-node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" >/tmp/after-fix-config.txt 2>&1
+node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" /tmp/after-fix-config.json >/tmp/after-fix-config.txt 2>&1
 node "$WORKSPACE/scripts/snapshot-state.mjs" "$STATE" >/tmp/after-fix-state.txt 2>&1
-FIX_SETTINGS=$(grep '^settings_without_meta: ' /tmp/after-fix-config.txt | cut -d' ' -f2-)
+node "$WORKSPACE/scripts/compare-settings.mjs" /tmp/before-config.json /tmp/after-fix-config.json >/tmp/settings-fix-diff.txt 2>&1
+FIX_EXIT=$?
+tee -a "$SUMMARY" </tmp/settings-fix-diff.txt
 FIX_OK=0
-[ "$FIX_SETTINGS" = "$BEFORE_SETTINGS" ] && FIX_OK=1
-check "settings still unchanged after doctor --fix" "$FIX_OK"
+[ "$FIX_EXIT" -eq 0 ] && FIX_OK=1
+check "operator settings still preserved after doctor --fix" "$FIX_OK"
 grep ' FACT auth_profile_' /tmp/after-fix-state.txt | sort >/tmp/after-fix-rows.txt
 FIX_AUTH_OK=0
 diff -q /tmp/before-rows.txt /tmp/after-fix-rows.txt >/dev/null && FIX_AUTH_OK=1
