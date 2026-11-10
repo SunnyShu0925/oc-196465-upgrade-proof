@@ -14,7 +14,7 @@ on:
       candidate_version:
         description: Candidate version stamped into the built tarball
         required: true
-        default: "2026.11.3-proof.1"
+        default: "2026.11.3"
 
 permissions:
   contents: read
