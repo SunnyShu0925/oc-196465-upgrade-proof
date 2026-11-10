@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Snapshot operator-visible state for the PR #196465 stable->head upgrade proof.
-// Prints SQLite files, schema user_version, and auth rows. Secret material is
-// reduced to a shape marker; volatile timestamps are kept out of the FACT lines
-// so before/after comparisons stay meaningful.
+// Prints every non-empty table with secrets reduced to shape markers, and keeps
+// volatile timestamps out of the FACT lines so before/after comparisons mean
+// something.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -22,29 +22,33 @@ const redact = (value) => {
 
 const SECRET_KEY = /token|secret|key|password|cookie/iu;
 const VOLATILE_KEY = /updated|timestamp|_at$|checked/iu;
+const IDENTITY_KEYS = ["id", "profileId", "profile_id", "name"];
+
+const summarizeJson = (text) => {
+  try {
+    const parsed = JSON.parse(text);
+    const profiles = parsed?.profiles;
+    if (profiles && typeof profiles === "object" && !Array.isArray(profiles)) {
+      const entries = Object.entries(profiles)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, profile]) => {
+          const facts = { id, provider: profile?.provider, mode: profile?.mode, type: profile?.type };
+          for (const field of ["token", "accessToken", "refreshToken", "apiKey"]) {
+            if (profile?.[field] !== undefined) facts[field] = redact(profile[field]);
+          }
+          return facts;
+        });
+      return { version: parsed.version, profiles: entries };
+    }
+  } catch {
+    // not JSON; fall through
+  }
+  return redact(text);
+};
 
 const summarizeValue = (key, value) => {
   if (typeof value !== "string") return value;
-  if (key === "store_json" || key === "state_json") {
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && parsed.profiles && typeof parsed.profiles === "object") {
-        const profiles = Object.entries(parsed.profiles)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([id, profile]) => {
-            const facts = { id, type: profile?.type, provider: profile?.provider };
-            for (const field of ["token", "accessToken", "refreshToken", "apiKey"]) {
-              if (profile?.[field] !== undefined) facts[field] = redact(profile[field]);
-            }
-            return facts;
-          });
-        return { version: parsed.version, profiles };
-      }
-    } catch {
-      // fall through to the generic redaction
-    }
-    return redact(value);
-  }
+  if (/json$/iu.test(key)) return summarizeJson(value);
   if (SECRET_KEY.test(key)) return redact(value);
   return value;
 };
@@ -85,19 +89,18 @@ for (const dbPath of dbs) {
     console.log(`\n[${rel}]`);
     console.log(`  schema_user_version: ${version.user_version}`);
     const tables = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-      .all()
+      .prepare("SELECT name FROM sqlite_master WHERE type = ? ORDER BY name")
+      .all("table")
       .map((row) => row.name);
-    console.log(`  tables: ${tables.length}`);
+    const counts = [];
+    const authTables = [];
     for (const table of tables) {
-      if (!/profile|auth|credential/iu.test(table)) continue;
-      const columns = db
-        .prepare(`PRAGMA table_info("${table}")`)
-        .all()
-        .map((row) => row.name);
-      const rows = db.prepare(`SELECT * FROM "${table}"`).all();
-      console.log(`  ${table}: ${rows.length} row(s) columns=${columns.join(",")}`);
-      for (const row of rows.slice(0, 20)) {
+      const count = db.prepare(`SELECT count(*) AS c FROM "${table}"`).get().c;
+      counts.push(`${table}(${count})`);
+      if (/profile|auth|credential|secret/iu.test(table)) authTables.push(`${table}(${count})`);
+      if (count === 0) continue;
+      const rows = db.prepare(`SELECT * FROM "${table}" LIMIT 3`).all();
+      for (const row of rows) {
         const shown = {};
         const facts = {};
         for (const key of Object.keys(row).sort()) {
@@ -107,6 +110,24 @@ for (const dbPath of dbs) {
         }
         console.log(`    ROW  ${table} ${JSON.stringify(shown)}`);
         console.log(`    FACT ${table} ${JSON.stringify(facts)}`);
+      }
+    }
+    console.log(`  tables: ${tables.length}`);
+    console.log(`  nonempty: ${counts.filter((entry) => !/\(0\)$/u.test(entry)).join(",") || "(none)"}`);
+    console.log(`  auth_tables: ${authTables.join(",") || "(none)"}`);
+    for (const table of tables) {
+      const count = db.prepare(`SELECT count(*) AS c FROM "${table}"`).get().c;
+      if (count === 0) continue;
+      const rows = db.prepare(`SELECT * FROM "${table}"`).all();
+      for (const row of rows) {
+        const text = JSON.stringify(row);
+        if (!text.includes("anthropic:proof")) continue;
+        const marker = {};
+        for (const key of Object.keys(row).sort()) {
+          if (IDENTITY_KEYS.includes(key) || /provider|mode|type/iu.test(key)) marker[key] = row[key];
+          else marker[key] = summarizeValue(key, row[key]);
+        }
+        console.log(`  PROFILE_FOUND ${table} ${JSON.stringify(marker)}`);
       }
     }
   } finally {

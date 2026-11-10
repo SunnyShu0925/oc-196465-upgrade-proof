@@ -79,6 +79,8 @@ printf '%s\n' "$TOKEN" | "$DRIVER" models auth paste-token --agent main --provid
 PASTE_EXIT=${PIPESTATUS[1]}
 note "paste-token exit=$PASTE_EXIT"
 "$DRIVER" models auth list --agent main 2>&1 | tail -10 | tee -a "$SUMMARY"
+"$DRIVER" models auth list --agent main --json >/tmp/before-auth.json 2>/tmp/before-auth.err || cp /tmp/before-auth.err /tmp/before-auth.json
+note "driver auth list --json exit=$? bytes=$(wc -c </tmp/before-auth.json)"
 note "--- auth store files written by driver ---"
 find "$STATE/agents" -name "*.sqlite" 2>/dev/null | sort | tee -a "$SUMMARY"
 
@@ -88,6 +90,8 @@ node "$WORKSPACE/scripts/config-facts.mjs" "$STATE/openclaw.json" /tmp/before-co
 node "$WORKSPACE/scripts/snapshot-state.mjs" "$STATE" >/tmp/before-state.txt 2>&1
 tee -a "$SUMMARY" </tmp/before-config.txt
 tee -a "$SUMMARY" </tmp/before-state.txt
+AGENT_STORE="$STATE/agents/main/agent/openclaw-agent.sqlite"
+note "scan gate store $AGENT_STORE: $([ -f "$AGENT_STORE" ] && echo present || echo absent)"
 
 # ── Step 6: driver baseline Doctor (pre-fix binary) ─────────────────────────
 say "step 6: driver Doctor baseline (published 2026.11.2, no fix)"
@@ -158,19 +162,24 @@ else
   check "state schema migrated by the candidate Doctor" 0 "no user_version change"
 fi
 
-grep ' FACT auth_profile_' /tmp/before-state.txt | sort >/tmp/before-rows.txt
-grep ' FACT auth_profile_' /tmp/after-state.txt | sort >/tmp/after-rows.txt
-ROWS_BEFORE=$(wc -l </tmp/before-rows.txt)
-ROWS_AFTER=$(wc -l </tmp/after-rows.txt)
+"$NEW_BIN" models auth list --agent main --json >/tmp/after-auth.json 2>/tmp/after-auth.err || cp /tmp/after-auth.err /tmp/after-auth.json
+node "$WORKSPACE/scripts/compare-auth.mjs" /tmp/before-auth.json /tmp/after-auth.json >/tmp/auth-diff.txt 2>&1
+AUTH_EXIT=$?
+tee -a "$SUMMARY" </tmp/auth-diff.txt
 AUTH_OK=0
-if [ "$ROWS_BEFORE" -gt 0 ] && diff -q /tmp/before-rows.txt /tmp/after-rows.txt >/dev/null; then AUTH_OK=1; fi
-check "auth profile rows preserved ($ROWS_BEFORE -> $ROWS_AFTER rows)" "$AUTH_OK"
+[ "$AUTH_EXIT" -eq 0 ] && AUTH_OK=1
+check "saved auth profile preserved through the upgrade" "$AUTH_OK"
 
-note "--- auth rows before ---"; cat /tmp/before-rows.txt | tee -a "$SUMMARY"
-note "--- auth rows after ---"; cat /tmp/after-rows.txt | tee -a "$SUMMARY"
+note "--- rows mentioning the profile, before ---"; grep 'PROFILE_FOUND' /tmp/before-state.txt | tee -a "$SUMMARY" || true
+note "--- rows mentioning the profile, after ---"; grep 'PROFILE_FOUND' /tmp/after-state.txt | tee -a "$SUMMARY" || true
+note "--- non-empty tables, before ---"; grep '^  nonempty: ' /tmp/before-state.txt | tee -a "$SUMMARY" || true
+note "--- non-empty tables, after ---"; grep '^  nonempty: ' /tmp/after-state.txt | tee -a "$SUMMARY" || true
 
 # ── Step 11: the fix, exercised on the upgraded state ──────────────────────
 say "step 11: agent-dir read failure surfaces on the upgraded state"
+note "--- candidate writes the agent-dir store the scan reads ---"
+printf '%s\n' "$TOKEN" | "$NEW_BIN" models auth paste-token --agent main --provider anthropic --profile-id anthropic:proof 2>&1 | tail -4 | tee -a "$SUMMARY"
+note "scan gate store $AGENT_STORE: $([ -f "$AGENT_STORE" ] && echo present || echo absent)"
 note "agents root mode before: $(stat -c %a "$STATE/agents")"
 chmod 111 "$STATE/agents"
 note "agents root mode now:    $(stat -c %a "$STATE/agents") (list denied, traversal kept)"
@@ -199,11 +208,13 @@ tee -a "$SUMMARY" </tmp/settings-fix-diff.txt
 FIX_OK=0
 [ "$FIX_EXIT" -eq 0 ] && FIX_OK=1
 check "operator settings still preserved after doctor --fix" "$FIX_OK"
-grep ' FACT auth_profile_' /tmp/after-fix-state.txt | sort >/tmp/after-fix-rows.txt
+"$NEW_BIN" models auth list --agent main --json >/tmp/after-fix-auth.json 2>/tmp/after-fix-auth.err || cp /tmp/after-fix-auth.err /tmp/after-fix-auth.json
+node "$WORKSPACE/scripts/compare-auth.mjs" /tmp/before-auth.json /tmp/after-fix-auth.json >/tmp/auth-fix-diff.txt 2>&1
+FIX_AUTH_EXIT=$?
+tee -a "$SUMMARY" </tmp/auth-fix-diff.txt
 FIX_AUTH_OK=0
-diff -q /tmp/before-rows.txt /tmp/after-fix-rows.txt >/dev/null && FIX_AUTH_OK=1
-check "auth profile rows still preserved after doctor --fix" "$FIX_AUTH_OK"
-note "--- auth rows after --fix ---"; cat /tmp/after-fix-rows.txt | tee -a "$SUMMARY"
+[ "$FIX_AUTH_EXIT" -eq 0 ] && FIX_AUTH_OK=1
+check "saved auth profile still present after doctor --fix" "$FIX_AUTH_OK"
 
 # ── Verdict ────────────────────────────────────────────────────────────────
 say "FINAL VERDICT"
